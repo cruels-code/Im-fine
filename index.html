@@ -89,6 +89,23 @@
       visibility: hidden;
       animation: none;
     }
+    #loader-status {
+      position: fixed;
+      top: calc(50% + 26px);
+      left: 50%;
+      transform: translateX(-50%);
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.08em;
+      color: rgba(216, 203, 184, 0.45);
+      pointer-events: none;
+      z-index: 5;
+      white-space: nowrap;
+      transition: opacity 0.6s ease, visibility 0.6s ease;
+    }
+    #loader.hidden + #loader-status {
+      opacity: 0;
+      visibility: hidden;
+    }
     @keyframes loader-spin {
       to { transform: rotate(360deg); }
     }
@@ -97,6 +114,7 @@
 <body>
   <canvas id="monolith"></canvas>
   <div id="loader" aria-hidden="true"></div>
+  <div id="loader-status" aria-hidden="true"></div>
   <div id="cursor-reticle" aria-hidden="true"></div>
 
   <!-- =========================================================================
@@ -207,7 +225,17 @@
     }
 
     async function fetchPartsBytes(partUrls) {
-      const chunks = await Promise.all(partUrls.map((u) => fetchBytesWithRetry(u, 3)));
+      const mobile = typeof IS_MOBILE !== "undefined" && IS_MOBILE;
+      let chunks;
+      if (mobile) {
+        chunks = [];
+        for (let i = 0; i < partUrls.length; i++) {
+          self.postMessage({ type: "status", text: `downloading model (${i + 1}/${partUrls.length})…` });
+          chunks.push(await fetchBytesWithRetry(partUrls[i], 3));
+        }
+      } else {
+        chunks = await Promise.all(partUrls.map((u) => fetchBytesWithRetry(u, 3)));
+      }
       let total = 0;
       for (let i = 0; i < chunks.length; i++) total += chunks[i].byteLength;
       const merged = new Uint8Array(total);
@@ -215,6 +243,7 @@
       for (let i = 0; i < chunks.length; i++) {
         merged.set(chunks[i], off);
         off += chunks[i].byteLength;
+        chunks[i] = null;
       }
       return merged;
     }
@@ -1547,7 +1576,9 @@
             }
           } catch (_svErr) {}
 
-          const modelBytes = await fetchModelWithIDB(
+          const mobile = typeof IS_MOBILE !== "undefined" && IS_MOBILE;
+          self.postMessage({ type: "status", text: "loading neural weights…" });
+          let modelBytes = await fetchModelWithIDB(
             base + "StyleGAN2-FFHQ-1024-Ablatable.onnx",
             "stylegan2_ffhq_1024_ablatable_v1",
             [
@@ -1555,6 +1586,7 @@
               base + "StyleGAN2-FFHQ-1024-Ablatable.onnx.part2",
             ]
           );
+          self.postMessage({ type: "status", text: "initializing webgpu…" });
           try {
             genSession = await ort.InferenceSession.create(modelBytes, {
               executionProviders: ["webgpu"],
@@ -1562,63 +1594,76 @@
             });
             console.info("[ParanoiaLoop] StyleGAN2-FFHQ-1024 active (WebGPU)");
           } catch (_gpuErr) {
+            self.postMessage({ type: "status", text: "initializing wasm…" });
             genSession = await ort.InferenceSession.create(modelBytes, {
               executionProviders: ["wasm"],
               graphOptimizationLevel: "all",
             });
             console.info("[ParanoiaLoop] StyleGAN2-FFHQ-1024 active (WASM)");
           }
+          modelBytes = null;
 
-          // Load Real-ESRGAN x4plus FP16 ONNX (256x256 eye crop -> 1024x1024 macro eye)
-          try {
-            const srBytes = await fetchModelWithIDB(
-              base + "realesrgan_x4plus_fp16.onnx",
-              "realesrgan_x4plus_fp16_v1"
-            );
+          // Load Real-ESRGAN x4plus FP16 ONNX (desktop only — skipped on mobile to stay within Android/iOS RAM limits)
+          if (!mobile) {
             try {
-              srSession = await ort.InferenceSession.create(srBytes, {
-                executionProviders: ["webgpu"],
-                graphOptimizationLevel: "all",
-              });
-              console.info("[ParanoiaLoop] Real-ESRGAN x4plus active (WebGPU)");
-            } catch (_srGpuErr) {
-              srSession = await ort.InferenceSession.create(srBytes, {
-                executionProviders: ["wasm"],
-                graphOptimizationLevel: "all",
-              });
-              console.info("[ParanoiaLoop] Real-ESRGAN x4plus active (WASM)");
+              let srBytes = await fetchModelWithIDB(
+                base + "realesrgan_x4plus_fp16.onnx",
+                "realesrgan_x4plus_fp16_v1"
+              );
+              try {
+                srSession = await ort.InferenceSession.create(srBytes, {
+                  executionProviders: ["webgpu"],
+                  graphOptimizationLevel: "all",
+                });
+                console.info("[ParanoiaLoop] Real-ESRGAN x4plus active (WebGPU)");
+              } catch (_srGpuErr) {
+                srSession = await ort.InferenceSession.create(srBytes, {
+                  executionProviders: ["wasm"],
+                  graphOptimizationLevel: "all",
+                });
+                console.info("[ParanoiaLoop] Real-ESRGAN x4plus active (WASM)");
+              }
+              srBytes = null;
+            } catch (srErr) {
+              console.warn("[ParanoiaLoop] Real-ESRGAN fallback active:", srErr && srErr.message ? srErr.message : srErr);
             }
-          } catch (srErr) {
-            console.warn("[ParanoiaLoop] Real-ESRGAN fallback active:", srErr && srErr.message ? srErr.message : srErr);
+          } else {
+            console.info("[ParanoiaLoop] Mobile mode: skipping Real-ESRGAN (native StyleGAN2 eye crop active)");
           }
 
-          // Load Depth Anything V2 Small ONNX (cached in IDB, WebGPU -> WASM fallback)
-          try {
-            const depthBytes = await fetchModelWithIDB(
-              base + "depth_anything_v2_small.onnx",
-              "depth_anything_v2_small_fp16_v1"
-            );
+          // Load Depth Anything V2 Small ONNX (desktop only — mobile uses fast analytic eye-relief depth to stay within RAM limits)
+          if (!mobile) {
             try {
-              depthSession = await ort.InferenceSession.create(depthBytes, {
-                executionProviders: ["webgpu"],
-                graphOptimizationLevel: "all",
-              });
-              console.info("[ParanoiaLoop] Depth-Anything-V2-Small active (WebGPU)");
-            } catch (_dGpuErr) {
-              depthSession = await ort.InferenceSession.create(depthBytes, {
-                executionProviders: ["wasm"],
-                graphOptimizationLevel: "all",
-              });
-              console.info("[ParanoiaLoop] Depth-Anything-V2-Small active (WASM)");
+              let depthBytes = await fetchModelWithIDB(
+                base + "depth_anything_v2_small.onnx",
+                "depth_anything_v2_small_fp16_v1"
+              );
+              try {
+                depthSession = await ort.InferenceSession.create(depthBytes, {
+                  executionProviders: ["webgpu"],
+                  graphOptimizationLevel: "all",
+                });
+                console.info("[ParanoiaLoop] Depth-Anything-V2-Small active (WebGPU)");
+              } catch (_dGpuErr) {
+                depthSession = await ort.InferenceSession.create(depthBytes, {
+                  executionProviders: ["wasm"],
+                  graphOptimizationLevel: "all",
+                });
+                console.info("[ParanoiaLoop] Depth-Anything-V2-Small active (WASM)");
+              }
+              depthBytes = null;
+            } catch (dErr) {
+              console.warn("[ParanoiaLoop] Depth fallback active:", dErr && dErr.message ? dErr.message : dErr);
             }
-          } catch (dErr) {
-            console.warn("[ParanoiaLoop] Depth fallback active:", dErr && dErr.message ? dErr.message : dErr);
+          } else {
+            console.info("[ParanoiaLoop] Mobile mode: analytic 3D eye-relief depth active");
           }
 
+          self.postMessage({ type: "status", text: "generating…" });
           let tick = 0;
           while (true) {
             const tStart = performance.now();
-            const maxTry = tick === 0 ? 16 : 28;
+            const maxTry = mobile ? (tick === 0 ? 4 : 8) : (tick === 0 ? 16 : 28);
             const { face128, rgba1024, depth224, eyeGeom } = await sampleCleanIdentity(maxTry);
             criticPort.postMessage(
               {
@@ -1632,12 +1677,14 @@
               [face128.buffer, rgba1024.buffer, depth224.buffer]
             );
             tick++;
-            const cadenceMs = 6000 + Math.random() * 4000;
+            const cadenceMs = (mobile ? 9000 : 6000) + Math.random() * 4000;
             const waitMs = Math.max(1500, cadenceMs - (performance.now() - tStart));
             await new Promise((r) => setTimeout(r, waitMs));
           }
         } catch (err) {
-          console.warn("[ParanoiaLoop] StyleGAN2-FFHQ fallback:", err && err.message ? err.message : err);
+          const msg = err && err.message ? err.message : String(err);
+          self.postMessage({ type: "status", text: "load error: " + msg });
+          console.warn("[ParanoiaLoop] StyleGAN2-FFHQ fallback:", msg);
         }
       }
     };
@@ -2041,6 +2088,12 @@
         computeLowBand(portraits[k], portraitsLow[k]);
       }
       canvasNCHW.set(targetFaceNCHW);
+      if (typeof IS_MOBILE !== "undefined" && IS_MOBILE) {
+        useFallback = true;
+        console.info("[ParanoiaLoop] Mobile mode: lightweight InMemoryPatchGAN critic active");
+        runLoop();
+        return;
+      }
       try {
         const base = (typeof APP_BASE_URL === "string" && APP_BASE_URL)
           ? APP_BASE_URL
@@ -2471,21 +2524,31 @@
       });
       if (!gl) return;
 
-      gl.getExtension("EXT_color_buffer_float");
+      const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ||
+        (navigator.maxTouchPoints > 1 && Math.min(window.screen.width, window.screen.height) < 900);
+
+      const extColorFloat = gl.getExtension("EXT_color_buffer_float");
+      const extColorHalf = gl.getExtension("EXT_color_buffer_half_float");
       gl.getExtension("OES_texture_float_linear");
+      gl.getExtension("OES_texture_half_float_linear");
+      const hasFloatFbo = !!(extColorFloat || extColorHalf);
+      const FBO_INTERNAL_FMT = hasFloatFbo ? gl.RGBA16F : gl.RGBA8;
+      const FBO_SRC_TYPE = hasFloatFbo ? gl.FLOAT : gl.UNSIGNED_BYTE;
 
       const CRITIC_SIZE = 128;
       const DEPTH_SIZE = 448;
       const HI_SIZE = 1024;
-      const FBO_SIZE = 1024;
-      const PARTICLE_GRID = 640;
+      const FBO_SIZE = IS_MOBILE ? 512 : 1024;
+      const PARTICLE_GRID = IS_MOBILE ? 320 : 640;
       const PARTICLE_COUNT = PARTICLE_GRID * PARTICLE_GRID;
       function computeViewportSize() {
         const cw = Math.max(2, canvas.clientWidth || window.innerWidth);
         const ch = Math.max(2, canvas.clientHeight || window.innerHeight);
-        const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+        const dpr = Math.min(window.devicePixelRatio || 1, IS_MOBILE ? 1.0 : 1.5);
+        const maxW = IS_MOBILE ? 1080 : 1920;
+        const maxH = IS_MOBILE ? 1080 : 1200;
         // Scale uniformly so backing buffer always matches exact CSS display aspect ratio (zero stretching)
-        const scale = Math.min(dpr, 1920 / cw, 1200 / ch);
+        const scale = Math.min(dpr, maxW / cw, maxH / ch);
         return {
           w: Math.max(2, Math.round(cw * scale)),
           h: Math.max(2, Math.round(ch * scale)),
@@ -3966,7 +4029,7 @@
       function createFloatTex(w, h) {
         const tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, tex);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+        gl.texImage2D(gl.TEXTURE_2D, 0, FBO_INTERNAL_FMT, w, h, 0, gl.RGBA, FBO_SRC_TYPE, null);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -4034,9 +4097,9 @@
         configureHdrDrawingBuffer(viewW, viewH);
         for (let i = 0; i < 2; i++) {
           gl.bindTexture(gl.TEXTURE_2D, trailTex[i]);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, viewW, viewH, 0, gl.RGBA, gl.FLOAT, null);
+          gl.texImage2D(gl.TEXTURE_2D, 0, FBO_INTERNAL_FMT, viewW, viewH, 0, gl.RGBA, FBO_SRC_TYPE, null);
           gl.bindTexture(gl.TEXTURE_2D, bloomTex[i]);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, bloomW, bloomH, 0, gl.RGBA, gl.FLOAT, null);
+          gl.texImage2D(gl.TEXTURE_2D, 0, FBO_INTERNAL_FMT, bloomW, bloomH, 0, gl.RGBA, FBO_SRC_TYPE, null);
         }
         gl.bindRenderbuffer(gl.RENDERBUFFER, trailDepthRb);
         gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, viewW, viewH);
@@ -4193,8 +4256,8 @@
         if (reticle) reticle.classList.remove("active");
       });
 
-      // Launch inline Blob Web Workers with subpath-safe base URL (works on localhost, LAN & GitHub Pages /<repo>/)
-      const appBasePreamble = `const APP_BASE_URL = ${JSON.stringify(new URL("./", window.location.href).href)};\n`;
+      // Launch inline Blob Web Workers with subpath-safe base URL & mobile flag (works on localhost, LAN & GitHub Pages /<repo>/)
+      const appBasePreamble = `const APP_BASE_URL = ${JSON.stringify(new URL("./", window.location.href).href)};\nconst IS_MOBILE = ${IS_MOBILE};\n`;
       const workerBlob = new Blob(
         [appBasePreamble, document.getElementById("critic-worker").textContent],
         { type: "application/javascript" }
@@ -4205,6 +4268,12 @@
         { type: "application/javascript" }
       );
       const genWorker = new Worker(URL.createObjectURL(genBlob));
+      const loaderStatusEl = document.getElementById("loader-status");
+      genWorker.onmessage = (e) => {
+        if (e.data && e.data.type === "status" && loaderStatusEl) {
+          loaderStatusEl.textContent = e.data.text || "";
+        }
+      };
       const channel = new MessageChannel();
       worker.postMessage({ type: "connect_gen" }, [channel.port1]);
       genWorker.postMessage({ type: "init" }, [channel.port2]);
