@@ -2269,20 +2269,21 @@
           tensionMetric = res.tension;
         }
 
-        // Sequential pair-of-eyes anatomical zones so the Discriminator interrogates both eyes, brows & bridge
+        // Sequential pair-of-eyes + nose-repair zones: after each eye swaps into an odd pair,
+        // the Discriminator immediately sweeps the nose bridge to stitch/repair new nose bits in
         const landmarks = [
-          { x: 0.24, y: 0.50 }, // 0: Left Iris
-          { x: 0.24, y: 0.30 }, // 1: Left Brow
-          { x: 0.50, y: 0.46 }, // 2: Nose Bridge
-          { x: 0.76, y: 0.50 }, // 3: Right Iris
-          { x: 0.76, y: 0.30 }, // 4: Right Brow
-          { x: 0.50, y: 0.70 }, // 5: Lower Lids
+          { x: 0.24, y: 0.50 }, // 0: Left Eye
+          { x: 0.50, y: 0.44 }, // 1: Upper Nose Bridge & Glabella Repair
+          { x: 0.76, y: 0.50 }, // 2: Right Eye
+          { x: 0.50, y: 0.62 }, // 3: Lower Nose Bridge & Inner Cheek Repair
+          { x: 0.24, y: 0.34 }, // 4: Left Brow
+          { x: 0.76, y: 0.34 }, // 5: Right Brow
         ];
-        // Roving Discriminator interrogation glides across the macro eye anatomy
-        const cycle = elapsed * 0.30;
+        // Roving Discriminator interrogation glides across eyes and repairs the nose bridge between them
+        const cycle = elapsed * 0.32;
         const idxA = Math.floor(cycle) % landmarks.length;
         const idxB = (idxA + 1) % landmarks.length;
-        const activeFeatureMap = [0, 0, 2, 1, 1, 3];
+        const activeFeatureMap = [0, 2, 1, 3, 0, 1];
         activeFeatureIdx = activeFeatureMap[idxA];
         const frac = cycle - Math.floor(cycle);
         const smoothFrac = frac * frac * (3.0 - 2.0 * frac);
@@ -2580,9 +2581,11 @@
                 nextHostPortrait.set(incoming);
                 computeLowBand(nextHostPortrait, nextHostLowBand);
               } else {
-                // Only update an idle donor slot opposite the spotlight so parts never swap abruptly in place
+                // Alternate eye swaps with nose-bridge repair donors [left eye -> upper nose -> right eye -> lower nose]
                 role = "slot";
-                slot = nextSlot === activeFeatureIdx ? (nextSlot + 2) % 4 : nextSlot;
+                const slotOrder = [0, 2, 1, 3];
+                const desiredSlot = slotOrder[nextSlot % 4];
+                slot = desiredSlot === activeFeatureIdx ? slotOrder[(nextSlot + 2) % 4] : desiredSlot;
                 portraits[slot].set(incoming);
                 computeLowBand(portraits[slot], portraitsLow[slot]);
                 nextSlot = (nextSlot + 1) % 4;
@@ -2768,11 +2771,11 @@
           vec3 d2Low = textureLod(u_d2, v_uv, 4.2).rgb * 2.0 - 1.0;
           vec3 d3Low = textureLod(u_d3, v_uv, 4.2).rgb * 2.0 - 1.0;
 
-          // Pair-of-eyes anatomical elliptical weights (NCHW orientation: y=0 top, y=1 bottom)
+          // Pair-of-eyes + natural nose-bridge repair ellipses (NCHW orientation: y=0 top, y=1 bottom)
           vec2 e0 = (v_uv - vec2(0.24, 0.50)) / vec2(0.22, 0.22); // left eye
           vec2 e1 = (v_uv - vec2(0.76, 0.50)) / vec2(0.22, 0.22); // right eye
-          vec2 e2 = (v_uv - vec2(0.50, 0.46)) / vec2(0.18, 0.26); // nose bridge & inner brows
-          vec2 e3 = (v_uv - vec2(0.50, 0.74)) / vec2(0.38, 0.20); // lower lids & upper cheeks
+          vec2 e2 = (v_uv - vec2(0.50, 0.44)) / vec2(0.19, 0.28); // upper/mid nose bridge & glabella
+          vec2 e3 = (v_uv - vec2(0.50, 0.68)) / vec2(0.24, 0.24); // lower nose bridge & inner cheeks
           float w0 = exp(-0.5 * dot(e0, e0));
           float w1 = exp(-0.5 * dot(e1, e1));
           float w2 = exp(-0.5 * dot(e2, e2));
@@ -2784,14 +2787,14 @@
           vec2 df = v_uv - u_spot;
           float d2 = dot(df, df);
           float focus = exp(-d2 / (2.0 * u_radius * u_radius));
-          float patchR = max(u_radius * 2.05, 0.150);
+          float patchR = max(u_radius * 2.15, 0.165);
           float patchMask = exp(-d2 / (2.0 * patchR * patchR));
-          float stitchMask = min(1.0, featureMask * patchMask * 1.35);
+          float stitchMask = min(1.0, featureMask * patchMask * 1.55);
 
           vec3 donorLow = d0Low * w0 + d1Low * w1 + d2Low * w2 + d3Low * w3;
           vec3 donorHigh = (d0Sharp - d0Low) * w0 + (d1Sharp - d1Low) * w1 + (d2Sharp - d2Low) * w2 + (d3Sharp - d3Low) * w3;
 
-          vec3 lowBand = mix(hostLow, donorLow, 0.85 * stitchMask);
+          vec3 lowBand = mix(hostLow, donorLow, 0.94 * stitchMask);
           vec3 highBand = mix(hostHigh, donorHigh, stitchMask);
           vec3 chimeraTarget = clamp(lowBand + highBand, -1.0, 1.0);
 
@@ -3298,11 +3301,11 @@
           float d2 = texture(u_d2, nUV).r;
           float d3 = texture(u_d3, nUV).r;
 
-          // Exact same pair-of-eyes anatomical ellipses as FS_CHIMERA
+          // Exact same pair-of-eyes + nose-bridge repair ellipses as FS_CHIMERA
           vec2 e0 = (nUV - vec2(0.24, 0.50)) / vec2(0.22, 0.22);
           vec2 e1 = (nUV - vec2(0.76, 0.50)) / vec2(0.22, 0.22);
-          vec2 e2 = (nUV - vec2(0.50, 0.46)) / vec2(0.18, 0.26);
-          vec2 e3 = (nUV - vec2(0.50, 0.74)) / vec2(0.38, 0.20);
+          vec2 e2 = (nUV - vec2(0.50, 0.44)) / vec2(0.19, 0.28);
+          vec2 e3 = (nUV - vec2(0.50, 0.68)) / vec2(0.24, 0.24);
           float w0 = exp(-0.5 * dot(e0, e0));
           float w1 = exp(-0.5 * dot(e1, e1));
           float w2 = exp(-0.5 * dot(e2, e2));
@@ -3315,9 +3318,9 @@
           vec2 df = nUV - spotN;
           float d2Spot = dot(df, df);
           float focus = exp(-d2Spot / (2.0 * u_radius * u_radius));
-          float patchR = max(u_radius * 2.05, 0.150);
+          float patchR = max(u_radius * 2.15, 0.165);
           float patchMask = exp(-d2Spot / (2.0 * patchR * patchR));
-          float stitchMask = min(1.0, featureMask * patchMask * 1.35);
+          float stitchMask = min(1.0, featureMask * patchMask * 1.55);
 
           float donorD = d0 * w0 + d1 * w1 + d2 * w2 + d3 * w3;
           float chimeraD = mix(dHost, donorD, stitchMask);
