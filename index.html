@@ -1316,48 +1316,64 @@
             }
           }
 
-          // 5c. Pick the innermost white-sclera pixel closest to the tear duct whose 7x7 patch is verified white sclera
-          let bestMedD = -1;
-          let bestX = -1, bestY = -1;
+          // 5c. Find the sharpest medial corner (V-shaped tapering apex of the white sclera nearest the nose)
+          // Group connected white-sclera pixels by X column to measure vertical lid convergence
+          const colStats = new Map();
+          let maxColH = 0;
+          let maxMedD = -1;
           for (let i = 0; i < whitePts.length; i += 2) {
             const px = whitePts[i], py = whitePts[i + 1];
             const d = medDir * (px - cx);
-            if (d < bestMedD) continue;
-            // Verify 7x7 neighborhood around candidate is genuinely white sclera (never on skin/caruncle/lash edge)
-            let patchL = 0.0, patchW = 0.0, patchS = 0.0, whiteCnt = 0;
-            for (let oy = -3; oy <= 3; oy += 3) {
-              for (let ox = -3; ox <= 3; ox += 3) {
-                const l = lum(px + ox, py + oy);
-                const w = warmth(px + ox, py + oy);
-                const s = satAt(px + ox, py + oy);
-                patchL += l; patchW += w; patchS += s;
-                if (l >= lumFloor * 0.94 && w < 0.095 && s < 0.180) whiteCnt++;
-              }
+            if (d > maxMedD) maxMedD = d;
+            let st = colStats.get(px);
+            if (!st) {
+              st = { minY: py, maxY: py, sumY: py, cnt: 1, d };
+              colStats.set(px, st);
+            } else {
+              if (py < st.minY) st.minY = py;
+              if (py > st.maxY) st.maxY = py;
+              st.sumY += py;
+              st.cnt++;
             }
-            patchL /= 9.0; patchW /= 9.0; patchS /= 9.0;
-            if (whiteCnt >= 8 && patchL >= 0.46 && patchW < 0.088 && patchS < 0.165) {
-              if (d > bestMedD || (d === bestMedD && Math.abs(py - (cy + 4)) < Math.abs(bestY - (cy + 4)))) {
-                bestMedD = d;
-                bestX = px;
-                bestY = py;
-              }
+          }
+          for (const st of colStats.values()) {
+            const h = st.maxY - st.minY;
+            if (h > maxColH) maxColH = h;
+          }
+
+          // Walk inward from the furthest medial white column (0..6px back) to find the sharp apex pixel
+          // strictly inside white sclera where upper & lower lids pinch together toward the nose
+          let bestX = -1, bestY = -1, bestMedD = -1, bestTipH = 999;
+          for (const [px, st] of colStats.entries()) {
+            if (st.d < maxMedD - 6) continue;
+            const colH = st.maxY - st.minY;
+            // Sharp corner check: lids must taper narrower than the main medial sclera
+            if (colH > Math.max(14, maxColH * 0.58)) continue;
+            const midY = Math.round(st.sumY / st.cnt);
+            if (!isWhiteSclera(px, midY)) continue;
+            // Prefer the furthest medial white pixel (closest to the nose), breaking ties by sharpest (narrowest) column
+            if (st.d > bestMedD || (st.d === bestMedD && colH < bestTipH)) {
+              bestMedD = st.d;
+              bestTipH = colH;
+              bestX = px;
+              bestY = midY;
             }
           }
 
-          if (bestX >= 0) {
-            // Confirm tear duct caruncle / inner corner lies immediately medial (4..18px) of this white-sclera tip
+          if (bestX >= 0 && maxColH >= 10) {
+            // Confirm the sharp white corner terminates immediately (2..14px closer to nose) into the caruncle/lid corner
             let hitCaruncle = false;
-            for (let step = 4; step <= 18; step += 2) {
+            for (let step = 2; step <= 14; step += 2) {
               const cx2 = bestX + medDir * step;
               const l2 = lum(cx2, bestY);
               const w2 = warmth(cx2, bestY);
-              if (l2 < lumFloor * 0.86 || w2 >= 0.098) {
+              if (l2 < lumFloor * 0.88 || w2 >= 0.095) {
                 hitCaruncle = true;
                 break;
               }
             }
             const scleraSpan = bestMedD - dMedial;
-            if (hitCaruncle && scleraSpan >= 14 && scleraSpan <= 92) {
+            if (hitCaruncle && scleraSpan >= 16 && scleraSpan <= 96) {
               tearPxX = bestX;
               tearPxY = bestY;
               tearConf = 1.0;
