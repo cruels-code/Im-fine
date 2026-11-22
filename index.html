@@ -189,15 +189,25 @@
       return v;
     }
 
-    async function fetchModelBytes(url, partUrls = null) {
-      const resp = await fetch(url);
-      if (resp.ok) return new Uint8Array(await resp.arrayBuffer());
-      if (!partUrls || !partUrls.length) throw new Error("HTTP " + resp.status);
-      const chunks = await Promise.all(partUrls.map(async (u) => {
-        const r = await fetch(u);
-        if (!r.ok) throw new Error("HTTP " + r.status + " (" + u + ")");
-        return new Uint8Array(await r.arrayBuffer());
-      }));
+    async function fetchBytesWithRetry(u, attempts = 3) {
+      let lastErr = null;
+      for (let a = 0; a < attempts; a++) {
+        try {
+          const r = await fetch(u);
+          if (r.ok) return new Uint8Array(await r.arrayBuffer());
+          lastErr = new Error("HTTP " + r.status + " (" + u + ")");
+          if (r.status === 404) throw lastErr;
+        } catch (err) {
+          lastErr = err;
+          if (err && /HTTP 404/.test(String(err.message || ""))) throw err;
+        }
+        if (a + 1 < attempts) await new Promise((res) => setTimeout(res, 600 * (a + 1)));
+      }
+      throw lastErr || new Error("Failed to fetch " + u);
+    }
+
+    async function fetchPartsBytes(partUrls) {
+      const chunks = await Promise.all(partUrls.map((u) => fetchBytesWithRetry(u, 3)));
       let total = 0;
       for (let i = 0; i < chunks.length; i++) total += chunks[i].byteLength;
       const merged = new Uint8Array(total);
@@ -207,6 +217,24 @@
         off += chunks[i].byteLength;
       }
       return merged;
+    }
+
+    async function fetchModelBytes(url, partUrls = null) {
+      const hasParts = !!(partUrls && partUrls.length);
+      const preferParts = hasParts && /\.github\.io\//i.test(url);
+      if (preferParts) {
+        try {
+          return await fetchPartsBytes(partUrls);
+        } catch (_partsErr) {
+          return await fetchBytesWithRetry(url, 3);
+        }
+      }
+      try {
+        return await fetchBytesWithRetry(url, hasParts ? 2 : 3);
+      } catch (singleErr) {
+        if (!hasParts) throw singleErr;
+        return await fetchPartsBytes(partUrls);
+      }
     }
 
     async function fetchModelWithIDB(url, cacheKey, partUrls = null) {
@@ -2020,7 +2048,21 @@
         importScripts(base + "vendor/ort/ort.all.min.js");
         ort.env.wasm.wasmPaths = base + "vendor/ort/";
         ort.env.wasm.numThreads = 1;
-        ortSession = await ort.InferenceSession.create(base + "paranoia_critic.onnx?v=" + Date.now(), {
+        let criticBytes = null;
+        let lastCriticErr = null;
+        for (let a = 0; a < 3; a++) {
+          try {
+            const cr = await fetch(base + "paranoia_critic.onnx");
+            if (!cr.ok) throw new Error("HTTP " + cr.status);
+            criticBytes = new Uint8Array(await cr.arrayBuffer());
+            break;
+          } catch (ce) {
+            lastCriticErr = ce;
+            if (a < 2) await new Promise((r) => setTimeout(r, 600 * (a + 1)));
+          }
+        }
+        if (!criticBytes) throw lastCriticErr || new Error("Failed to fetch paranoia_critic.onnx");
+        ortSession = await ort.InferenceSession.create(criticBytes, {
           executionProviders: ["webgpu", "wasm"],
         });
         console.info("[ParanoiaLoop] Active: paranoia_critic.onnx");
@@ -2422,7 +2464,8 @@
       const canvas = document.getElementById("monolith");
       const gl = canvas.getContext("webgl2", {
         antialias: true,
-        alpha: false,
+        alpha: true,
+        premultipliedAlpha: true,
         depth: true,
         powerPreference: "high-performance",
       });
