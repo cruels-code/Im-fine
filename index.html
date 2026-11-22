@@ -3801,7 +3801,15 @@
             vec2 cmR = vec2((a_uv.x - pR.x) * 2.3077, a_uv.y - pR.y);
             bool isLeftEye = length(cmL) <= length(cmR);
             vec2 cmNear = isLeftEye ? cmL : cmR;
-            float noiseZone = smoothstep(0.04, 0.78, corneaMask) * (1.0 - blinkMask);
+            vec3 eyeG = isLeftEye ? u_eye_geom_l : u_eye_geom_r;
+            float rNorm = length(cmNear) / max(eyeG.x, 0.05);
+            // Soft velvety feathering from pupil core out to the iris rim & eyelid margins (zero hard edges)
+            float softRadial = smoothstep(1.02, 0.25, rNorm);
+            float upperArchY = eyeG.y - 1.35 * cmNear.x * cmNear.x;
+            float lowerArchY = -eyeG.z + 0.90 * cmNear.x * cmNear.x;
+            float softLids = smoothstep(upperArchY + 0.004, upperArchY - 0.032, cmNear.y)
+                           * smoothstep(lowerArchY - 0.004, lowerArchY + 0.028, cmNear.y);
+            float noiseZone = smoothstep(0.02, 0.96, corneaMask) * softRadial * softLids * (1.0 - blinkMask);
             if (noiseZone > 0.004) {
               uint fr = uint(u_frame);
               // 2x square white-noise grain cells (pattern-free PCG3D integer hash)
@@ -3809,7 +3817,7 @@
               float n = float(pcg3dV(uvec3(noiseCell.x, noiseCell.y, fr)).x) * (1.0 / 4294967295.0);
               float snow = smoothstep(0.10, 0.90, n);
               if (u_crt_static > 0.001) {
-                float crtMask = noiseZone * u_crt_static;
+                float crtMask = pow(noiseZone, 1.45) * u_crt_static;
                 vec3 noiseCol = vec3(snow * 1.42);
                 noiseCol += vec3(1.0, 0.99, 0.97) * (catchlightHdr * 0.95);
                 col = mix(col, noiseCol, crtMask);
