@@ -1241,53 +1241,129 @@
           }
         }
 
-        // 5. Measure exact inner tip of the white medial sclera right next to the tear duct (full-colour 1024x1024)
-        // + strict 4-point anatomical confidence gate so a tear ONLY forms when placement is dead-certain
+        // 5. Connected 2D white-sclera walk from the medial limbus to the exact innermost white pixel beside the tear duct
+        // Guarantees the tear origin is ALWAYS as close as possible to the tear duct AND strictly inside white sclera
         const medDir = isLeft ? 1 : -1;
-        let maxScleraL = 0.0;
-        let lastWhiteD = dMedial + 46;
-        let lastWhiteY = cy + 12;
-        let hitCaruncle = false;
-        for (let d = dMedial + 12; d <= dMedial + 112; d += 2) {
-          const sx = cx + medDir * d;
-          let colBestL = 0.0, colBestY = cy + 10, colWarm = 0.0;
-          for (let dy = -6; dy <= 34; dy += 4) {
-            const l = lum(sx, cy + dy);
-            const w = warmth(sx, cy + dy);
-            const scScore = l - Math.max(0.0, w - 0.05) * 1.6;
-            if (scScore > colBestL) { colBestL = scScore; colBestY = cy + dy; colWarm = w; }
-          }
-          if (colBestL > maxScleraL) maxScleraL = colBestL;
-          if (colBestL >= Math.max(0.32, maxScleraL * 0.64) && colWarm < 0.15) {
-            lastWhiteD = d;
-            lastWhiteY = colBestY;
-          } else if (d > dMedial + 28 && maxScleraL > 0.42) {
-            // Cleanly detected transition from bright white sclera into the pink/darker tear duct caruncle
-            hitCaruncle = true;
-            break;
-          }
-        }
-        const targetD = Math.max(dMedial + 30, Math.min(dMedial + 92, lastWhiteD - 6));
-        const tearPxX = cx + medDir * targetD;
-        const tearPxY = Math.min(cy + 26, lastWhiteY + 8);
+        const satAt = (x, y) => {
+          const xi = Math.max(0, Math.min(HI_SIZE - 1, Math.round(x)));
+          const yi = Math.max(0, Math.min(HI_SIZE - 1, Math.round(y)));
+          const o = (yi * HI_SIZE + xi) * 4;
+          const r = eyeRgba1024[o], g = eyeRgba1024[o + 1], b = eyeRgba1024[o + 2];
+          return (Math.max(r, g, b) - Math.min(r, g, b)) / 255.0;
+        };
 
-        // Verify the exact tear anchor pixel itself sits inside bright, low-warmth white sclera
-        let anchorL = 0.0, anchorW = 0.0;
-        for (let oy = -4; oy <= 4; oy += 4) {
-          for (let ox = -4; ox <= 4; ox += 4) {
-            anchorL += lum(tearPxX + ox, tearPxY + oy);
-            anchorW += warmth(tearPxX + ox, tearPxY + oy);
+        // 5a. Locate the brightest pure-white medial sclera seed immediately beside the medial limbus
+        let seedX = -1, seedY = -1, peakScleraL = 0.0;
+        for (let d = dMedial + 8; d <= dMedial + 36; d += 2) {
+          const sx = Math.round(cx + medDir * d);
+          for (let dy = -10; dy <= 12; dy += 2) {
+            const sy = Math.round(cy + dy);
+            const l = lum(sx, sy);
+            const w = warmth(sx, sy);
+            const s = satAt(sx, sy);
+            if (l >= 0.46 && w < 0.090 && s < 0.175) {
+              const sc = l - Math.max(0.0, w - 0.03) * 1.4 - s * 0.6;
+              if (sc > peakScleraL) {
+                peakScleraL = l;
+                seedX = sx;
+                seedY = sy;
+              }
+            }
           }
         }
-        anchorL /= 9.0;
-        anchorW /= 9.0;
-        const scleraSpan = lastWhiteD - dMedial;
-        const tearConf = (
-          hitCaruncle &&
-          maxScleraL >= 0.44 &&
-          scleraSpan >= 26 && scleraSpan <= 86 &&
-          anchorL >= 0.40 && anchorW < 0.13
-        ) ? 1.0 : 0.0;
+
+        // 5b. 2D BFS strictly through connected white-sclera pixels (2px grid) toward the medial canthus / tear duct
+        let tearPxX = Math.round(cx + medDir * (dMedial + 28));
+        let tearPxY = Math.round(cy + 4);
+        let tearConf = 0.0;
+
+        if (seedX >= 0 && peakScleraL >= 0.48) {
+          const minD = dMedial + 6;
+          const maxD = dMedial + 114;
+          const minY = Math.max(4, Math.round(cy - 16));
+          const maxY = Math.min(HI_SIZE - 5, Math.round(cy + 20));
+          const lumFloor = Math.max(0.44, peakScleraL * 0.68);
+          const isWhiteSclera = (x, y) => {
+            const l = lum(x, y);
+            if (l < lumFloor) return false;
+            const w = warmth(x, y);
+            if (w >= 0.092) return false;
+            const s = satAt(x, y);
+            return s < 0.175;
+          };
+
+          const visited = new Set();
+          const qx = [seedX], qy = [seedY];
+          visited.add((seedY << 11) | seedX);
+          const whitePts = [];
+
+          for (let head = 0; head < qx.length; head++) {
+            const px = qx[head], py = qy[head];
+            whitePts.push(px, py);
+            const dirs = [[2, 0], [-2, 0], [0, 2], [0, -2]];
+            for (let k = 0; k < 4; k++) {
+              const nx = px + dirs[k][0], ny = py + dirs[k][1];
+              if (ny < minY || ny > maxY || nx < 4 || nx >= HI_SIZE - 4) continue;
+              const nd = medDir * (nx - cx);
+              if (nd < minD || nd > maxD) continue;
+              const key = (ny << 11) | nx;
+              if (visited.has(key)) continue;
+              if (isWhiteSclera(nx, ny)) {
+                visited.add(key);
+                qx.push(nx);
+                qy.push(ny);
+              }
+            }
+          }
+
+          // 5c. Pick the innermost white-sclera pixel closest to the tear duct whose 7x7 patch is verified white sclera
+          let bestMedD = -1;
+          let bestX = -1, bestY = -1;
+          for (let i = 0; i < whitePts.length; i += 2) {
+            const px = whitePts[i], py = whitePts[i + 1];
+            const d = medDir * (px - cx);
+            if (d < bestMedD) continue;
+            // Verify 7x7 neighborhood around candidate is genuinely white sclera (never on skin/caruncle/lash edge)
+            let patchL = 0.0, patchW = 0.0, patchS = 0.0, whiteCnt = 0;
+            for (let oy = -3; oy <= 3; oy += 3) {
+              for (let ox = -3; ox <= 3; ox += 3) {
+                const l = lum(px + ox, py + oy);
+                const w = warmth(px + ox, py + oy);
+                const s = satAt(px + ox, py + oy);
+                patchL += l; patchW += w; patchS += s;
+                if (l >= lumFloor * 0.94 && w < 0.095 && s < 0.180) whiteCnt++;
+              }
+            }
+            patchL /= 9.0; patchW /= 9.0; patchS /= 9.0;
+            if (whiteCnt >= 8 && patchL >= 0.46 && patchW < 0.088 && patchS < 0.165) {
+              if (d > bestMedD || (d === bestMedD && Math.abs(py - (cy + 4)) < Math.abs(bestY - (cy + 4)))) {
+                bestMedD = d;
+                bestX = px;
+                bestY = py;
+              }
+            }
+          }
+
+          if (bestX >= 0) {
+            // Confirm tear duct caruncle / inner corner lies immediately medial (4..18px) of this white-sclera tip
+            let hitCaruncle = false;
+            for (let step = 4; step <= 18; step += 2) {
+              const cx2 = bestX + medDir * step;
+              const l2 = lum(cx2, bestY);
+              const w2 = warmth(cx2, bestY);
+              if (l2 < lumFloor * 0.86 || w2 >= 0.098) {
+                hitCaruncle = true;
+                break;
+              }
+            }
+            const scleraSpan = bestMedD - dMedial;
+            if (hitCaruncle && scleraSpan >= 14 && scleraSpan <= 92) {
+              tearPxX = bestX;
+              tearPxY = bestY;
+              tearConf = 1.0;
+            }
+          }
+        }
 
         const upOff = Math.max(0.042, Math.min(0.092, upPx / HI_SIZE));
         const loOff = Math.max(0.056, Math.min(0.115, loPx / HI_SIZE));
@@ -3679,7 +3755,7 @@
             float lowerArchY = -loOff + 0.95 * cmNear.x * cmNear.x;
             float noiseLidClip = smoothstep(upperArchY + 0.022, upperArchY - 0.028, cmNear.y)
                                * smoothstep(lowerArchY - 0.055, lowerArchY + 0.020, cmNear.y);
-            float noiseZone = smoothstep(rIris * 3.70, rIris * 0.53, rCornea) * noiseLidClip * (1.0 - blinkMask);
+            float noiseZone = smoothstep(rIris * 2.22, rIris * 0.32, rCornea) * noiseLidClip * (1.0 - blinkMask);
             if (noiseZone > 0.004) {
               uint fr = uint(u_frame);
               // 2x square white-noise grain cells (pattern-free PCG3D integer hash)
