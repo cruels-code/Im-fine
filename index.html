@@ -1109,74 +1109,134 @@
       return { eyeRgba1024, eyeNchw128 };
     }
 
-    // High-precision 1024x1024 per-eye iris center, limbal radius & upper/lower eyelid arch detector
-    function detectExactIrises1024(eyeRgba1024, estLx = 248, estLy = 512, estRx = 776, estRy = 512) {
+    // High-precision 1024x1024 Daugman circular iris detector + eyelid arch + lighting-invariant sharp medial tear-duct detector
+    function detectExactIrises1024(eyeRgba1024, estLx = 224, estLy = 512, estRx = 800, estRy = 512) {
+      const ASPECT = 480.0 / 208.0; // exact physical width/height ratio of packed 1024x1024 eyeRgba1024
       const lum = (x, y) => {
-        const cx = Math.max(0, Math.min(HI_SIZE - 1, x | 0));
-        const cy = Math.max(0, Math.min(HI_SIZE - 1, y | 0));
+        const cx = Math.max(0, Math.min(HI_SIZE - 1, Math.round(x)));
+        const cy = Math.max(0, Math.min(HI_SIZE - 1, Math.round(y)));
         const p4 = (cy * HI_SIZE + cx) << 2;
         return (0.299 * eyeRgba1024[p4] + 0.587 * eyeRgba1024[p4 + 1] + 0.114 * eyeRgba1024[p4 + 2]) / 255.0;
       };
-      const warmth = (x, y) => {
-        const cx = Math.max(0, Math.min(HI_SIZE - 1, x | 0));
-        const cy = Math.max(0, Math.min(HI_SIZE - 1, y | 0));
+      const redness = (x, y) => {
+        const cx = Math.max(0, Math.min(HI_SIZE - 1, Math.round(x)));
+        const cy = Math.max(0, Math.min(HI_SIZE - 1, Math.round(y)));
         const p4 = (cy * HI_SIZE + cx) << 2;
-        return (eyeRgba1024[p4] - eyeRgba1024[p4 + 2]) / 255.0;
+        const r = eyeRgba1024[p4] / 255.0;
+        const b = eyeRgba1024[p4 + 2] / 255.0;
+        return (r - b) / (r + 0.04);
+      };
+      const whiteness = (x, y) => {
+        const l = lum(x, y);
+        const rd = redness(x, y);
+        return l * Math.max(0.0, 1.0 - rd * 1.45);
       };
 
-      const findOne = (nomX, nomY, isLeft, halfSpanX = 64, halfSpanY = 68) => {
-        const xMin = Math.max(64, Math.round(nomX - halfSpanX));
-        const xMax = Math.min(HI_SIZE - 65, Math.round(nomX + halfSpanX));
-        const yMin = Math.max(160, Math.round(nomY - halfSpanY));
-        const yMax = Math.min(HI_SIZE - 161, Math.round(nomY + halfSpanY));
+      // Adaptive skin redness baseline on the nose bridge (invariant to warm/cool portrait lighting)
+      let skinRedSum = 0.0, skinCnt = 0;
+      for (let y = 580; y <= 760; y += 12) {
+        for (let x = 468; x <= 556; x += 8) {
+          skinRedSum += redness(x, y);
+          skinCnt++;
+        }
+      }
+      const skinRed = Math.max(0.32, Math.min(0.68, skinRedSum / Math.max(1, skinCnt)));
 
-        // 1. Coarse-to-fine dark pupil+iris core matcher (stays strictly inside sclera, zero outward lash bias)
-        const evalCandidate = (x, y) => {
+      // Daugman circular limbus arc unit vectors (left, right, bottom — excludes upper eyelashes & eyeliner!)
+      const leftArc = [-25, -10, 5, 20, 35].map((deg) => {
+        const a = ((180 + deg) * Math.PI) / 180.0;
+        return [Math.cos(a), Math.sin(a)];
+      });
+      const rightArc = [-25, -10, 5, 20, 35].map((deg) => {
+        const a = (deg * Math.PI) / 180.0;
+        return [Math.cos(a), Math.sin(a)];
+      });
+      const botArc = [60, 75, 90, 105, 120].map((deg) => {
+        const a = (deg * Math.PI) / 180.0;
+        return [Math.cos(a), Math.sin(a)];
+      });
+
+      const findOne = (nomX, nomY, isLeft, halfSpanX = 56, halfSpanY = 64) => {
+        const xMin = Math.max(76, Math.round(nomX - halfSpanX));
+        const xMax = Math.min(HI_SIZE - 77, Math.round(nomX + halfSpanX));
+        const yMin = Math.max(200, Math.round(nomY - halfSpanY * 0.55));
+        const yMax = Math.min(HI_SIZE - 200, Math.round(nomY + halfSpanY * 1.15));
+
+        const evalCircle = (cx, cy, rPx) => {
+          const ryPx = rPx * ASPECT;
+          let lEdge = 0.0, rEdge = 0.0, bEdge = 0.0, lWhite = 0.0, rWhite = 0.0;
+          for (let i = 0; i < leftArc.length; i++) {
+            const [ux, uy] = leftArc[i];
+            const lIn = Math.min(lum(cx + ux * rPx * 0.76, cy + uy * ryPx * 0.76), 0.52);
+            const lOut = lum(cx + ux * rPx * 1.24, cy + uy * ryPx * 1.24);
+            lEdge += (lOut - lIn);
+            lWhite += whiteness(cx + ux * rPx * 1.28, cy + uy * ryPx * 1.28);
+          }
+          for (let i = 0; i < rightArc.length; i++) {
+            const [ux, uy] = rightArc[i];
+            const lIn = Math.min(lum(cx + ux * rPx * 0.76, cy + uy * ryPx * 0.76), 0.52);
+            const lOut = lum(cx + ux * rPx * 1.24, cy + uy * ryPx * 1.24);
+            rEdge += (lOut - lIn);
+            rWhite += whiteness(cx + ux * rPx * 1.28, cy + uy * ryPx * 1.28);
+          }
+          for (let i = 0; i < botArc.length; i++) {
+            const [ux, uy] = botArc[i];
+            const lIn = Math.min(lum(cx + ux * rPx * 0.74, cy + uy * ryPx * 0.74), 0.52);
+            const lOut = lum(cx + ux * rPx * 1.18, cy + uy * ryPx * 1.18);
+            bEdge += (lOut - lIn);
+          }
+          lEdge /= leftArc.length;
+          rEdge /= rightArc.length;
+          bEdge /= botArc.length;
+          lWhite /= leftArc.length;
+          rWhite /= rightArc.length;
+
+          // Centered pitch-black pupil core (catchlights capped at 0.38)
           let coreSum = 0.0, coreCnt = 0;
-          for (let dy = -30; dy <= 30; dy += 6) {
-            const ny = dy / 32.0;
-            const maxDx = Math.floor(14.0 * Math.sqrt(Math.max(0.0, 1.0 - ny * ny)));
-            for (let dx = -maxDx; dx <= maxDx; dx += 4) {
-              // Cap at 0.36 so bright specular catchlights inside the pupil/iris never push the center off-axis
-              coreSum += Math.min(lum(x + dx, y + dy), 0.36);
+          for (let dy = -16; dy <= 16; dy += 8) {
+            for (let dx = -8; dx <= 8; dx += 4) {
+              coreSum += Math.min(lum(cx + dx, cy + dy), 0.38);
               coreCnt++;
             }
           }
-          const coreLum = coreSum / Math.max(1, coreCnt);
-          // Tight bilateral sclera flanks (x ± 38px stays inside white sclera before outer lash shadow)
-          const flL = 0.5 * (lum(x - 36, y) + lum(x - 44, y + 6));
-          const flR = 0.5 * (lum(x + 36, y) + lum(x + 44, y + 6));
-          const minFlank = Math.min(flL, flR);
-          const belowLum = lum(x, y + 68);
-          const dist2 = (x - nomX) * (x - nomX) * 2.0 + (y - nomY) * (y - nomY) * 1.4;
-          return minFlank * 0.95 + belowLum * 0.25 - coreLum * 3.80 - dist2 * 0.00006;
+          const coreDark = Math.max(0.0, 0.38 - coreSum / coreCnt);
+          const skinCenterPen = Math.max(0.0, redness(cx, cy) - 0.36) * 2.5;
+          const minLR = Math.min(lEdge, rEdge);
+          const minW = Math.min(lWhite, rWhite);
+          const distPen = ((cx - nomX) * (cx - nomX) * 0.00004) + ((cy - (nomY + 14)) * (cy - (nomY + 14)) * 0.000018);
+          return minLR * 3.4 + (lEdge + rEdge) * 0.85 + Math.max(-0.08, bEdge) * 1.65
+               + minW * 1.8 + (lWhite + rWhite) * 0.55 + coreDark * 2.8 - skinCenterPen - distPen;
         };
 
-        let bestX = nomX, bestY = nomY, bestS = -1e9;
-        for (let y = yMin; y <= yMax; y += 5) {
-          for (let x = xMin; x <= xMax; x += 5) {
-            const s = evalCandidate(x, y);
-            if (s > bestS) { bestS = s; bestX = x; bestY = y; }
+        // 1. Coarse-to-fine Daugman circular limbus search (100% immune to upper eyelashes & dark eyeliner)
+        let bestX = nomX, bestY = nomY + 14, bestR = 49, bestS = -1e9;
+        for (let rPx = 43; rPx <= 57; rPx += 4) {
+          for (let y = yMin; y <= yMax; y += 6) {
+            for (let x = xMin; x <= xMax; x += 5) {
+              const s = evalCircle(x, y, rPx);
+              if (s > bestS) { bestS = s; bestX = x; bestY = y; bestR = rPx; }
+            }
           }
         }
-        const rx0 = bestX, ry0 = bestY;
-        for (let y = ry0 - 6; y <= ry0 + 6; y += 2) {
-          for (let x = rx0 - 6; x <= rx0 + 6; x += 2) {
-            const s = evalCandidate(x, y);
-            if (s > bestS) { bestS = s; bestX = x; bestY = y; }
+        const rx0 = bestX, ry0 = bestY, rr0 = bestR;
+        for (let rPx = Math.max(41, rr0 - 4); rPx <= Math.min(58, rr0 + 4); rPx += 2) {
+          for (let y = ry0 - 9; y <= ry0 + 9; y += 3) {
+            for (let x = rx0 - 6; x <= rx0 + 6; x += 2) {
+              const s = evalCircle(x, y, rPx);
+              if (s > bestS) { bestS = s; bestX = x; bestY = y; bestR = rPx; }
+            }
           }
         }
 
-        // 2. Refine BOTH cx & cy directly on the pitch-black pupil + inner iris core centroid (zero outward lash pull!)
+        // 2. Micro pupil-core centroid snap strictly inside r <= 0.34*rPx (cannot reach upper lashes)
+        const ryBest = bestR * ASPECT;
         let wx = 0.0, wy = 0.0, ws = 0.0;
-        let coreMin = 1.0;
-        for (let dy = -34; dy <= 34; dy += 2) {
-          const ny = dy / 36.0;
-          const maxDx = Math.floor(17.0 * Math.sqrt(Math.max(0.0, 1.0 - ny * ny)));
+        for (let dy = -Math.round(ryBest * 0.32); dy <= Math.round(ryBest * 0.32); dy += 2) {
+          const ny = dy / (ryBest * 0.34);
+          const maxDx = Math.floor(bestR * 0.34 * Math.sqrt(Math.max(0.0, 1.0 - ny * ny)));
           for (let dx = -maxDx; dx <= maxDx; dx += 2) {
             const l = lum(bestX + dx, bestY + dy);
-            if (l < coreMin) coreMin = l;
-            const w = Math.max(0.0, 0.28 - l);
+            const w = Math.max(0.0, 0.22 - l);
             if (w > 0.0) {
               const w2 = w * w;
               wx += (bestX + dx) * w2;
@@ -1185,85 +1245,98 @@
             }
           }
         }
-        const cx = ws > 1e-4 ? (wx / ws) : bestX;
-        const cy = ws > 1e-4 ? (wy / ws) : bestY;
+        const cx = ws > 1e-4 ? Math.max(bestX - 5, Math.min(bestX + 5, wx / ws)) : bestX;
+        const cy = ws > 1e-4 ? Math.max(bestY - 8, Math.min(bestY + 8, wy / ws)) : bestY;
+        const rxPx = bestR;
+        const ryPx = rxPx * ASPECT;
+        const rIris = Math.max(0.092, Math.min(0.134, (rxPx / HI_SIZE) * ASPECT));
 
-        // 3. Measure true iris radius on the clean medial sclera side (immune to dark outer corner lashes)
-        const stripLum = (x, y) => {
-          let s = 0.0;
-          for (let dy = -12; dy <= 12; dy += 4) s += Math.min(lum(x, y + dy), 0.85);
-          return s / 7.0;
-        };
-        const scanLimbus = (dir) => {
-          let peakSclera = 0.0;
-          for (let d = 34; d <= 76; d += 2) {
-            const l = stripLum(cx + dir * d, cy);
-            if (l > peakSclera) peakSclera = l;
-          }
-          const thresh = coreMin + 0.44 * Math.max(0.15, peakSclera - coreMin);
-          for (let d = 18; d <= 68; d++) {
-            if (stripLum(cx + dir * d, cy) >= thresh) return d;
-          }
-          return 46;
-        };
-        const dMedial = scanLimbus(isLeft ? 1 : -1);
-        const dLateral = scanLimbus(isLeft ? -1 : 1);
-        const rxPx = Math.min(dLateral, dMedial + 6);
-        const rIris = Math.max(0.092, Math.min(0.136, (rxPx / HI_SIZE) * 2.30));
-
-        // 4. Measure exact upper eyelid lash/skin boundary (decreasing Y = upward in image) & lower lid boundary
-        let upPx = 66;
-        for (let dy = 24; dy <= 105; dy += 2) {
-          let lSum = 0.0, wSum = 0.0;
-          for (let dx = -12; dx <= 12; dx += 4) {
-            lSum += lum(cx + dx, cy - dy);
-            wSum += warmth(cx + dx, cy - dy);
-          }
-          const lAvg = lSum / 7.0;
-          const wAvg = wSum / 7.0;
-          if ((wAvg > 0.085 && lAvg > 0.22) || (dy > 42 && lAvg < coreMin * 0.78)) {
-            upPx = dy;
-            break;
+        // 3. Measure unobstructed iris stroma median luminance
+        const irisSamples = [];
+        for (let dy = -Math.round(ryPx * 0.15); dy <= Math.round(ryPx * 0.72); dy += 4) {
+          for (let dx = -Math.round(rxPx * 0.75); dx <= Math.round(rxPx * 0.75); dx += 3) {
+            const rn = Math.hypot(dx / rxPx, dy / ryPx);
+            if (rn >= 0.36 && rn <= 0.78) {
+              const l = lum(cx + dx, cy + dy);
+              if (l > 0.05 && l < 0.65) irisSamples.push(l);
+            }
           }
         }
-        let loPx = 86;
-        for (let dy = 28; dy <= 122; dy += 2) {
-          let lSum = 0.0, wSum = 0.0;
-          for (let dx = -12; dx <= 12; dx += 4) {
-            lSum += lum(cx + dx, cy + dy);
-            wSum += warmth(cx + dx, cy + dy);
-          }
-          const lAvg = lSum / 7.0;
-          const wAvg = wSum / 7.0;
-          if ((wAvg > 0.075 && lAvg > 0.28) || lAvg > 0.56) {
-            loPx = dy;
-            break;
-          }
-        }
+        irisSamples.sort((a, b) => a - b);
+        const irisMedL = irisSamples.length ? irisSamples[Math.floor(irisSamples.length * 0.5)] : 0.24;
 
-        // 5. Connected 2D white-sclera walk from the medial limbus to the exact innermost white pixel beside the tear duct
-        // Guarantees the tear origin is ALWAYS as close as possible to the tear duct AND strictly inside white sclera
+        // 4. Exact Upper Eyelid & Lashline boundary (walk up to warm lid skin, then tuck cleanly BELOW dark upper lashes)
+        const skinRedThresh = Math.min(0.42, skinRed * 0.74);
+        const upPts = [];
+        for (let dx = -Math.round(rxPx * 0.72); dx <= Math.round(rxPx * 0.72); dx += 4) {
+          const colX = cx + dx;
+          const archLimit = Math.round(ryPx * Math.sqrt(Math.max(0.05, 1.0 - (dx / rxPx) * (dx / rxPx))));
+          let ySkin = cy - archLimit;
+          for (let dy = Math.round(ryPx * 0.14); dy <= Math.round(ryPx * 1.15); dy += 2) {
+            const yy = cy - dy;
+            const l = lum(colX, yy);
+            const rd = redness(colX, yy);
+            if ((rd >= skinRedThresh && l >= 0.18) || (dy > ryPx * 0.35 && l >= Math.max(0.42, irisMedL + 0.22))) {
+              ySkin = yy;
+              break;
+            }
+          }
+          let yBelowLash = ySkin;
+          const lashDarkCut = Math.max(0.13, irisMedL * 0.64);
+          for (let step = 0; step <= 48; step += 2) {
+            const yy = ySkin + step;
+            if (yy >= cy - Math.round(ryPx * 0.16)) break;
+            const l = lum(colX, yy);
+            const rd = redness(colX, yy);
+            if (l < lashDarkCut || (rd >= skinRedThresh && l >= 0.16)) {
+              yBelowLash = yy + 5;
+            } else if (step >= 8) {
+              break;
+            }
+          }
+          const offPx = Math.max(ryPx * 0.18, Math.min(archLimit * 0.86, cy - yBelowLash));
+          upPts.push(offPx);
+        }
+        upPts.sort((a, b) => a - b);
+        const upPx = upPts.length ? upPts[Math.floor(upPts.length * 0.40)] : ryPx * 0.55;
+
+        // 5. Exact Lower Eyelid boundary (start at 0.62*ryPx so bright lower iris stroma is never clipped)
+        const loPts = [];
+        const loSkinRed = Math.min(0.46, skinRed * 0.80);
+        for (let dx = -Math.round(rxPx * 0.60); dx <= Math.round(rxPx * 0.60); dx += 4) {
+          const colX = cx + dx;
+          const archLimit = Math.round(ryPx * Math.sqrt(Math.max(0.05, 1.0 - (dx / rxPx) * (dx / rxPx))));
+          let loD = archLimit;
+          for (let dy = Math.round(ryPx * 0.62); dy <= Math.round(ryPx * 1.05); dy += 2) {
+            const yy = cy + dy;
+            const l = lum(colX, yy);
+            const rd = redness(colX, yy);
+            if ((rd >= loSkinRed && l >= 0.24) || l >= Math.max(0.50, irisMedL + 0.28)) {
+              loD = dy - 2;
+              break;
+            }
+          }
+          loPts.push(Math.max(ryPx * 0.62, Math.min(archLimit, loD)));
+        }
+        loPts.sort((a, b) => a - b);
+        const loPx = loPts.length ? loPts[Math.floor(loPts.length * 0.50)] : ryPx * 0.86;
+
+        // 6. Lighting-invariant 2D connected white-sclera BFS -> sharpest medial corner (tear duct) nearest the nose
         const medDir = isLeft ? 1 : -1;
-        const satAt = (x, y) => {
-          const xi = Math.max(0, Math.min(HI_SIZE - 1, Math.round(x)));
-          const yi = Math.max(0, Math.min(HI_SIZE - 1, Math.round(y)));
-          const o = (yi * HI_SIZE + xi) * 4;
-          const r = eyeRgba1024[o], g = eyeRgba1024[o + 1], b = eyeRgba1024[o + 2];
-          return (Math.max(r, g, b) - Math.min(r, g, b)) / 255.0;
-        };
+        const scleraRedSeed = Math.min(0.40, skinRed * 0.74);
+        const scleraRedWalk = Math.min(0.47, skinRed * 0.84);
 
-        // 5a. Locate the brightest pure-white medial sclera seed immediately beside the medial limbus
-        let seedX = -1, seedY = -1, peakScleraL = 0.0;
-        for (let d = dMedial + 8; d <= dMedial + 36; d += 2) {
+        let seedX = -1, seedY = -1, bestSeedScore = -1.0, peakScleraL = 0.0;
+        for (let d = Math.round(rxPx + 8); d <= Math.round(rxPx + 42); d += 2) {
           const sx = Math.round(cx + medDir * d);
-          for (let dy = -10; dy <= 12; dy += 2) {
+          for (let dy = -Math.round(ryPx * 0.14); dy <= Math.round(ryPx * 0.45); dy += 2) {
             const sy = Math.round(cy + dy);
             const l = lum(sx, sy);
-            const w = warmth(sx, sy);
-            const s = satAt(sx, sy);
-            if (l >= 0.46 && w < 0.090 && s < 0.175) {
-              const sc = l - Math.max(0.0, w - 0.03) * 1.4 - s * 0.6;
-              if (sc > peakScleraL) {
+            const rd = redness(sx, sy);
+            if (l >= 0.22 && rd < scleraRedSeed) {
+              const sc = l * (1.0 - rd * 1.45);
+              if (sc > bestSeedScore) {
+                bestSeedScore = sc;
                 peakScleraL = l;
                 seedX = sx;
                 seedY = sy;
@@ -1272,24 +1345,20 @@
           }
         }
 
-        // 5b. 2D BFS strictly through connected white-sclera pixels (2px grid) toward the medial canthus / tear duct
-        let tearPxX = Math.round(cx + medDir * (dMedial + 28));
-        let tearPxY = Math.round(cy + 4);
+        let tearPxX = Math.round(cx + medDir * (rxPx + 40));
+        let tearPxY = Math.round(cy + ryPx * 0.22);
         let tearConf = 0.0;
 
-        if (seedX >= 0 && peakScleraL >= 0.48) {
-          const minD = dMedial + 6;
-          const maxD = dMedial + 114;
-          const minY = Math.max(4, Math.round(cy - 16));
-          const maxY = Math.min(HI_SIZE - 5, Math.round(cy + 20));
-          const lumFloor = Math.max(0.44, peakScleraL * 0.68);
+        if (seedX >= 0 && peakScleraL >= 0.24) {
+          const minD = Math.round(rxPx + 4);
+          const maxD = Math.round(rxPx + 130);
+          const minY = Math.max(4, Math.round(cy - ryPx * 0.14));
+          const maxY = Math.min(HI_SIZE - 5, Math.round(cy + ryPx * 0.64));
+          const lumFloor = Math.max(0.20, peakScleraL * 0.54);
           const isWhiteSclera = (x, y) => {
             const l = lum(x, y);
             if (l < lumFloor) return false;
-            const w = warmth(x, y);
-            if (w >= 0.092) return false;
-            const s = satAt(x, y);
-            return s < 0.175;
+            return redness(x, y) < scleraRedWalk;
           };
 
           const visited = new Set();
@@ -1316,11 +1385,9 @@
             }
           }
 
-          // 5c. Find the sharpest medial corner (V-shaped tapering apex of the white sclera nearest the nose)
-          // Group connected white-sclera pixels by X column to measure vertical lid convergence
+          // Group connected white sclera by X-column to locate the sharpest medial V-corner nearest the nose
           const colStats = new Map();
-          let maxColH = 0;
-          let maxMedD = -1;
+          let maxColH = 0, maxMedD = -1;
           for (let i = 0; i < whitePts.length; i += 2) {
             const px = whitePts[i], py = whitePts[i + 1];
             const d = medDir * (px - cx);
@@ -1341,17 +1408,15 @@
             if (h > maxColH) maxColH = h;
           }
 
-          // Walk inward from the furthest medial white column (0..6px back) to find the sharp apex pixel
-          // strictly inside white sclera where upper & lower lids pinch together toward the nose
           let bestX = -1, bestY = -1, bestMedD = -1, bestTipH = 999;
           for (const [px, st] of colStats.entries()) {
-            if (st.d < maxMedD - 6) continue;
+            if (st.d < maxMedD - 10) continue;
             const colH = st.maxY - st.minY;
-            // Sharp corner check: lids must taper narrower than the main medial sclera
-            if (colH > Math.max(14, maxColH * 0.58)) continue;
+            if (colH > Math.max(22, maxColH * 0.65)) continue;
             const midY = Math.round(st.sumY / st.cnt);
-            if (!isWhiteSclera(px, midY)) continue;
-            // Prefer the furthest medial white pixel (closest to the nose), breaking ties by sharpest (narrowest) column
+            const lTip = lum(px, midY);
+            const rdTip = redness(px, midY);
+            if (lTip < Math.max(0.24, peakScleraL * 0.58) || rdTip >= scleraRedWalk) continue;
             if (st.d > bestMedD || (st.d === bestMedD && colH < bestTipH)) {
               bestMedD = st.d;
               bestTipH = colH;
@@ -1361,19 +1426,19 @@
           }
 
           if (bestX >= 0 && maxColH >= 10) {
-            // Confirm the sharp white corner terminates immediately (2..14px closer to nose) into the caruncle/lid corner
             let hitCaruncle = false;
-            for (let step = 2; step <= 14; step += 2) {
+            const tipRed = redness(bestX, bestY);
+            for (let step = 2; step <= 18; step += 2) {
               const cx2 = bestX + medDir * step;
               const l2 = lum(cx2, bestY);
-              const w2 = warmth(cx2, bestY);
-              if (l2 < lumFloor * 0.88 || w2 >= 0.095) {
+              const rd2 = redness(cx2, bestY);
+              if (l2 < lumFloor * 0.88 || rd2 >= Math.max(scleraRedWalk, tipRed + 0.06)) {
                 hitCaruncle = true;
                 break;
               }
             }
-            const scleraSpan = bestMedD - dMedial;
-            if (hitCaruncle && scleraSpan >= 16 && scleraSpan <= 96) {
+            const scleraSpan = bestMedD - rxPx;
+            if (hitCaruncle && scleraSpan >= 14 && scleraSpan <= 115) {
               tearPxX = bestX;
               tearPxY = bestY;
               tearConf = 1.0;
@@ -1381,10 +1446,10 @@
           }
         }
 
-        const upOff = Math.max(0.042, Math.min(0.092, upPx / HI_SIZE));
-        const loOff = Math.max(0.056, Math.min(0.115, loPx / HI_SIZE));
+        const upOff = Math.max(0.032, Math.min(0.115, upPx / HI_SIZE));
+        const loOff = Math.max(0.045, Math.min(0.125, loPx / HI_SIZE));
         return {
-          cx, cy, score: bestS,
+          cx, cy, score: bestS, irisMedL, skinRed,
           px: cx / HI_SIZE, py: 1.0 - cy / HI_SIZE,
           tearX: tearPxX / HI_SIZE, tearY: 1.0 - tearPxY / HI_SIZE,
           tearConf,
@@ -1392,10 +1457,9 @@
         };
       };
 
-      let L = findOne(estLx, estLy, true, 64, 68);
-      let R = findOne(estRx, estRy, false, 64, 68);
-      // Bilateral symmetry verification: if either eye drifted asymmetrically, re-lock around the mirrored peer
-      if (Math.abs(L.cy - R.cy) > 30 || Math.abs((L.cx + R.cx) - HI_SIZE) > 48) {
+      let L = findOne(estLx, estLy, true, 56, 64);
+      let R = findOne(estRx, estRy, false, 56, 64);
+      if (Math.abs(L.cy - R.cy) > 36 || Math.abs((L.cx + R.cx) - HI_SIZE) > 56) {
         if (L.score >= R.score) {
           R = findOne(HI_SIZE - L.cx, L.cy, false, 24, 24);
         } else {
@@ -1408,127 +1472,84 @@
         tearConf: [L.tearConf, R.tearConf],
         geomL: [L.rIris, L.upOff, L.loOff],
         geomR: [R.rIris, R.upOff, R.loOff],
+        metaL: { irisMedL: L.irisMedL, skinRed: L.skinRed },
+        metaR: { irisMedL: R.irisMedL, skinRed: R.skinRed },
       };
     }
 
-    // Bake high-contrast greyscale + 2D flood-filled coloured irises directly into the generated 1024x1024 image
-    // (eliminates post-process alignment drift: iris colour moves 100% locked to the actual pixels during all morphs)
+    // Bake high-contrast greyscale + pixel-exact circular eyelid-clipped coloured irises into RGB
+    // AND store the exact cornea/iris silhouette mask in ALPHA (0..255) so white noise & FX can NEVER spill outside the cornea/iris!
     function bakeGreyscaleWithColouredEyes1024(eyeRgba1024, eyeNchw128, eyeGeom, tintRGB) {
+      const ASPECT = 480.0 / 208.0;
+      const corneaMask = new Float32Array(HI_SIZE * HI_SIZE);
       const irisMask = new Float32Array(HI_SIZE * HI_SIZE);
       const eyes = [
-        { cx: eyeGeom.pupils[0] * HI_SIZE, cy: (1.0 - eyeGeom.pupils[1]) * HI_SIZE, g: eyeGeom.geomL },
-        { cx: eyeGeom.pupils[2] * HI_SIZE, cy: (1.0 - eyeGeom.pupils[3]) * HI_SIZE, g: eyeGeom.geomR },
+        { cx: eyeGeom.pupils[0] * HI_SIZE, cy: (1.0 - eyeGeom.pupils[1]) * HI_SIZE, g: eyeGeom.geomL, m: eyeGeom.metaL || { irisMedL: 0.24, skinRed: 0.50 } },
+        { cx: eyeGeom.pupils[2] * HI_SIZE, cy: (1.0 - eyeGeom.pupils[3]) * HI_SIZE, g: eyeGeom.geomR, m: eyeGeom.metaR || { irisMedL: 0.24, skinRed: 0.50 } },
       ];
+      const smooth = (e0, e1, x) => {
+        const t = Math.max(0.0, Math.min(1.0, (x - e0) / (e1 - e0)));
+        return t * t * (3.0 - 2.0 * t);
+      };
 
       for (let e = 0; e < 2; e++) {
-        const cx = Math.round(eyes[e].cx);
-        const cy = Math.round(eyes[e].cy);
+        const cx = eyes[e].cx;
+        const cy = eyes[e].cy;
         const rIris = eyes[e].g[0];
         const upOff = eyes[e].g[1];
         const loOff = eyes[e].g[2];
-        const bx0 = Math.max(0, cx - 88), bx1 = Math.min(HI_SIZE - 1, cx + 88);
-        const by0 = Math.max(0, cy - 150), by1 = Math.min(HI_SIZE - 1, cy + 150);
-        const bw = bx1 - bx0 + 1;
-        const bh = by1 - by0 + 1;
-        const visited = new Uint8Array(bw * bh);
-        const queue = new Int32Array(bw * bh);
-        let qHead = 0, qTail = 0;
+        const rxPx = (rIris / ASPECT) * HI_SIZE;
+        const ryPx = rIris * HI_SIZE;
+        const irisMedL = eyes[e].m.irisMedL;
+        const skinRed = eyes[e].m.skinRed;
+        const skinRedCut = Math.min(0.41, skinRed * 0.74);
 
-        // Seed 2D BFS from the dark pupil center
-        const pushSeed = (sx, sy) => {
-          if (sx < bx0 || sx > bx1 || sy < by0 || sy > by1) return;
-          const li = (sy - by0) * bw + (sx - bx0);
-          if (visited[li]) return;
-          visited[li] = 1;
-          queue[qTail++] = li;
-        };
-        for (let dy = -12; dy <= 12; dy += 3) {
-          for (let dx = -6; dx <= 6; dx += 3) pushSeed(cx + dx, cy + dy);
-        }
+        const bx0 = Math.max(0, Math.floor(cx - rxPx * 1.08));
+        const bx1 = Math.min(HI_SIZE - 1, Math.ceil(cx + rxPx * 1.08));
+        const by0 = Math.max(0, Math.floor(cy - ryPx * 1.08));
+        const by1 = Math.min(HI_SIZE - 1, Math.ceil(cy + ryPx * 1.08));
 
-        const dirs = [-1, 1, -bw, bw];
-        while (qHead < qTail) {
-          const cur = queue[qHead++];
-          const lx = cur % bw;
-          const ly = (cur / bw) | 0;
-          const px = bx0 + lx;
-          const py = by0 + ly;
-          const dxN = ((px - cx) / HI_SIZE) * 2.30;
+        for (let py = by0; py <= by1; py++) {
           const dyN = (cy - py) / HI_SIZE; // positive upward
-          const r = Math.hypot(dxN, dyN);
+          const outRow = py * HI_SIZE;
+          for (let px = bx0; px <= bx1; px++) {
+            const dxN = ((px - cx) / HI_SIZE) * ASPECT;
+            const r = Math.hypot(dxN, dyN);
+            const rNorm = r / rIris;
+            if (rNorm >= 1.02) continue;
 
-          for (let d = 0; d < 4; d++) {
-            const nxt = cur + dirs[d];
-            if (nxt < 0 || nxt >= bw * bh || visited[nxt]) continue;
-            const nlx = nxt % bw;
-            if (d === 0 && nlx === bw - 1) continue;
-            if (d === 1 && nlx === 0) continue;
-            const nly = (nxt / bw) | 0;
-            const npx = bx0 + nlx;
-            const npy = by0 + nly;
+            const circleW = smooth(1.00, 0.86, rNorm);
+            const upArch = upOff - 1.35 * dxN * dxN;
+            const loArch = -loOff + 0.90 * dxN * dxN;
+            const upW = smooth(upArch + 0.005, upArch - 0.011, dyN);
+            const loW = smooth(loArch - 0.006, loArch + 0.011, dyN);
 
-            const ndx = ((npx - cx) / HI_SIZE) * 2.30;
-            const ndy = (cy - npy) / HI_SIZE;
-            const nr = Math.hypot(ndx, ndy);
-            if (nr > rIris * 1.06) continue;
-            const upArch = upOff - 1.45 * ndx * ndx;
-            const loArch = -loOff + 0.95 * ndx * ndx;
-            if (ndy > upArch || ndy < loArch) continue;
-
-            const p4 = (npy * HI_SIZE + npx) << 2;
+            const p4 = (outRow + px) << 2;
             const rr = eyeRgba1024[p4] / 255.0;
             const gg = eyeRgba1024[p4 + 1] / 255.0;
             const bb = eyeRgba1024[p4 + 2] / 255.0;
             const l = 0.299 * rr + 0.587 * gg + 0.114 * bb;
-            const sat = Math.max(rr, gg, bb) - Math.min(rr, gg, bb);
-            // Stop cleanly at white sclera outside inner catchlight core
-            if (nr > rIris * 0.46 && (l - sat * 0.55) > 0.41) continue;
-            // Stop cleanly at warm upper/lower eyelid skin
-            if (Math.abs(ndy) > 0.022 && (rr - bb) > 0.080 && l > 0.23) continue;
+            const rd = (rr - bb) / (rr + 0.04);
 
-            visited[nxt] = 1;
-            queue[qTail++] = nxt;
-          }
-        }
+            let clean = 1.0;
+            if (Math.abs(dyN) > rIris * 0.25 && rd > skinRedCut && l > 0.18) {
+              clean *= smooth(skinRedCut + 0.07, skinRedCut, rd);
+            }
+            if (rNorm > 0.68 && rd < 0.36 && l > Math.max(0.42, irisMedL + 0.18)) {
+              clean *= smooth(Math.max(0.54, irisMedL + 0.30), Math.max(0.40, irisMedL + 0.16), l);
+            }
 
-        // Anti-aliased 3px feather of the flood-filled iris mask into irisMask
-        const tmp = new Float32Array(bw * bh);
-        for (let ly = 0; ly < bh; ly++) {
-          const row = ly * bw;
-          for (let lx = 0; lx < bw; lx++) {
-            let s = 0.0;
-            for (let k = -2; k <= 2; k++) {
-              const xx = Math.max(0, Math.min(bw - 1, lx + k));
-              s += visited[row + xx];
-            }
-            tmp[row + lx] = s * 0.2;
-          }
-        }
-        for (let ly = 0; ly < bh; ly++) {
-          const py = by0 + ly;
-          const outRow = py * HI_SIZE;
-          for (let lx = 0; lx < bw; lx++) {
-            let s = 0.0;
-            for (let k = -2; k <= 2; k++) {
-              const yy = Math.max(0, Math.min(bh - 1, ly + k));
-              s += tmp[yy * bw + lx];
-            }
-            const v = s * 0.2;
-            if (v > 0.005) {
-              const px = bx0 + lx;
-              const dxN = ((px - cx) / HI_SIZE) * 2.30;
-              const dyN = (cy - py) / HI_SIZE;
-              const r = Math.hypot(dxN, dyN);
-              // Exclude pitch-black pupil core so pupil stays deep black while iris stroma gets vivid pigment
-              const pupilHole = Math.max(0.0, Math.min(1.0, (r - rIris * 0.22) / (rIris * 0.20)));
-              const m = v * pupilHole;
-              if (m > irisMask[outRow + px]) irisMask[outRow + px] = m;
-            }
+            const cMask = circleW * upW * loW * clean;
+            if (cMask > corneaMask[outRow + px]) corneaMask[outRow + px] = cMask;
+
+            const pupilHole = smooth(0.24, 0.42, rNorm);
+            const iMask = cMask * pupilHole;
+            if (iMask > irisMask[outRow + px]) irisMask[outRow + px] = iMask;
           }
         }
       }
 
-      // Bake high-contrast silver-gelatin greyscale everywhere + vivid iris colour directly into eyeRgba1024
+      // Bake high-contrast silver-gelatin greyscale everywhere + vivid iris colour + exact corneaMask in ALPHA
       const [tr, tg, tb] = tintRGB;
       const totalPx = HI_SIZE * HI_SIZE;
       for (let i = 0; i < totalPx; i++) {
@@ -1538,15 +1559,14 @@
         const b = eyeRgba1024[p4 + 2] / 255.0;
         const lum = 0.299 * r + 0.587 * g + 0.114 * b;
 
-        // High-contrast silver-gelatin monochrome base
         let hc = Math.max(0.0, Math.min(1.0, (lum - 0.035) / 0.86));
         hc = Math.pow(hc, 0.90);
         const sc = hc * hc * (3.0 - 2.0 * hc);
         hc = hc * 0.25 + sc * 0.75;
 
         const m = irisMask[i];
-        // Protect pure white specular catchlights & deep black pupil shadows
-        const catchProt = Math.max(0.0, Math.min(1.0, (0.82 - lum) / 0.24)) * Math.max(0.0, Math.min(1.0, (lum - 0.04) / 0.09));
+        // Protect pure white specular catchlights while smoothly colouring dark iris fibers (pupil core is already excluded by pupilHole)
+        const catchProt = Math.max(0.0, Math.min(1.0, (0.82 - lum) / 0.24)) * Math.max(0.0, Math.min(1.0, (lum - 0.015) / 0.05));
         const cm = m * catchProt;
         if (cm > 0.005) {
           const fiberLift = Math.pow(Math.max(lum, 0.01), 0.84) * 1.62;
@@ -1562,6 +1582,8 @@
           eyeRgba1024[p4 + 1] = gv;
           eyeRgba1024[p4 + 2] = gv;
         }
+        // Alpha channel carries exact cornea/iris silhouette (0..255) into FS_CHIMERA & VS_PARTICLES
+        eyeRgba1024[p4 + 3] = Math.round(Math.max(0, Math.min(255, corneaMask[i] * 255)));
       }
 
       // Sync 128x128 critic proxy buffer with the baked greyscale+coloured-eyes image
@@ -2753,18 +2775,24 @@
         uniform float u_init;
 
         void main() {
-          vec3 hostSharp = textureLod(u_host, v_uv, 0.0).rgb * 2.0 - 1.0;
+          vec4 hostS4 = textureLod(u_host, v_uv, 0.0);
+          vec3 hostSharp = hostS4.rgb * 2.0 - 1.0;
+          float hostCornea = hostS4.a;
           if (u_init > 0.5) {
-            fragColor = vec4(hostSharp, 1.0);
+            fragColor = vec4(hostSharp, hostCornea);
             return;
           }
           vec3 hostLow = textureLod(u_host, v_uv, 4.2).rgb * 2.0 - 1.0;
           vec3 hostHigh = hostSharp - hostLow;
 
-          vec3 d0Sharp = textureLod(u_d0, v_uv, 0.0).rgb * 2.0 - 1.0;
-          vec3 d1Sharp = textureLod(u_d1, v_uv, 0.0).rgb * 2.0 - 1.0;
-          vec3 d2Sharp = textureLod(u_d2, v_uv, 0.0).rgb * 2.0 - 1.0;
-          vec3 d3Sharp = textureLod(u_d3, v_uv, 0.0).rgb * 2.0 - 1.0;
+          vec4 d0S4 = textureLod(u_d0, v_uv, 0.0);
+          vec4 d1S4 = textureLod(u_d1, v_uv, 0.0);
+          vec4 d2S4 = textureLod(u_d2, v_uv, 0.0);
+          vec4 d3S4 = textureLod(u_d3, v_uv, 0.0);
+          vec3 d0Sharp = d0S4.rgb * 2.0 - 1.0;
+          vec3 d1Sharp = d1S4.rgb * 2.0 - 1.0;
+          vec3 d2Sharp = d2S4.rgb * 2.0 - 1.0;
+          vec3 d3Sharp = d3S4.rgb * 2.0 - 1.0;
 
           vec3 d0Low = textureLod(u_d0, v_uv, 4.2).rgb * 2.0 - 1.0;
           vec3 d1Low = textureLod(u_d1, v_uv, 4.2).rgb * 2.0 - 1.0;
@@ -2793,12 +2821,15 @@
 
           vec3 donorLow = d0Low * w0 + d1Low * w1 + d2Low * w2 + d3Low * w3;
           vec3 donorHigh = (d0Sharp - d0Low) * w0 + (d1Sharp - d1Low) * w1 + (d2Sharp - d2Low) * w2 + (d3Sharp - d3Low) * w3;
+          float donorCornea = d0S4.a * w0 + d1S4.a * w1 + d2S4.a * w2 + d3S4.a * w3;
 
           vec3 lowBand = mix(hostLow, donorLow, 0.94 * stitchMask);
           vec3 highBand = mix(hostHigh, donorHigh, stitchMask);
           vec3 chimeraTarget = clamp(lowBand + highBand, -1.0, 1.0);
+          float targetCornea = mix(hostCornea, donorCornea, stitchMask);
 
-          vec3 prev = texture(u_prev_chimera, v_uv).rgb;
+          vec4 prev4 = texture(u_prev_chimera, v_uv);
+          vec3 prev = prev4.rgb;
           vec3 cDelta = texture(u_critic_delta, v_uv).rgb;
           vec3 criticVal = clamp(prev + cDelta, -1.0, 1.0);
 
@@ -2806,7 +2837,8 @@
           float criticW = clamp(focus * u_critic_weight * u_dt_step, 0.0, 0.45);
           float keepW = max(0.0, 1.0 - criticW - localBlend);
           vec3 outCol = clamp(criticVal * criticW + prev * keepW + chimeraTarget * localBlend, -1.0, 1.0);
-          fragColor = vec4(outCol, 1.0);
+          float outCornea = clamp(mix(prev4.a, targetCornea, localBlend), 0.0, 1.0);
+          fragColor = vec4(outCol, outCornea);
         }
       `;
 
@@ -3371,6 +3403,7 @@
 
         uniform sampler2D u_fbo;
         uniform sampler2D u_depth_state;
+        uniform sampler2D u_chimera;
         uniform float u_time;
         uniform vec3 u_cam; // x: yaw, y: pitch, z: distance
         uniform vec3 u_cam_handheld; // x: roll (rad), y: panX, z: panY
@@ -3469,6 +3502,8 @@
           vec4 raw4 = texture(u_fbo, sampleUV);
           vec3 t = clamp(raw4.rgb * 0.5 + 0.5, 0.0, 1.0);
           float lum = dot(t, vec3(0.299, 0.587, 0.114));
+          // Exact pixel-locked cornea/iris silhouette from FS_CHIMERA alpha (moves 1:1 with odd-pair morphs, blinks & saccades)
+          float corneaMask = clamp(texture(u_chimera, vec2(sampleUV.x, 1.0 - sampleUV.y)).a, 0.0, 1.0);
 
           // Read continuous spring-integrated per-particle depth, velocity & activity (zero snapping!)
           vec4 dState = texture(u_depth_state, a_uv);
@@ -3734,18 +3769,18 @@
           }
 
           // Pixel-exact UnrealGlow HDR emission + Idea 6 (Chromatic Iris Ignition) + Idea 1 (Iris Eclipse)
-          // All gated strictly by baked coloured iris pixels (pixSat) so alignment is 100% pixel-exact & never touches sclera/lids
+          // All gated strictly by pixel-locked corneaMask & baked coloured iris pixels (NEVER touches sclera, lashes, or lids)
           float pixSat = max(t.r, max(t.g, t.b)) - min(t.r, min(t.g, t.b));
           float eclipseBlack = 0.0;
           if (u_fx.x > 0.002 && !isSideRain) {
-            float isBakedIris = smoothstep(0.035, 0.13, pixSat);
+            float isBakedIris = corneaMask * smoothstep(0.035, 0.13, pixSat);
             if (isBakedIris > 0.004) {
-              vec2 ecL = vec2((a_uv.x - pL.x) * 2.3, a_uv.y - pL.y);
-              vec2 ecR = vec2((a_uv.x - pR.x) * 2.3, a_uv.y - pR.y);
+              vec2 ecL = vec2((a_uv.x - pL.x) * 2.3077, a_uv.y - pL.y);
+              vec2 ecR = vec2((a_uv.x - pR.x) * 2.3077, a_uv.y - pR.y);
               bool ecIsL = length(ecL) <= length(ecR);
               float ecRIris = ecIsL ? u_eye_geom_l.x : u_eye_geom_r.x;
               float ecRDist = length(ecIsL ? ecL : ecR);
-              float swallowR = mix(ecRIris * 0.20, ecRIris * 1.45, u_fx.x);
+              float swallowR = mix(ecRIris * 0.20, ecRIris * 1.15, u_fx.x);
               float inSwallow = smoothstep(swallowR, swallowR * 0.55, ecRDist) * (1.0 - blinkMask);
               float catchKeep = smoothstep(0.68, 0.88, lum);
               eclipseBlack = inSwallow * isBakedIris * u_fx.x * (1.0 - catchKeep * 0.94);
@@ -3753,36 +3788,28 @@
               col += vec3(1.0, 0.99, 0.98) * (catchlightHdr * 0.65 * inSwallow * isBakedIris * u_fx.x);
             }
           }
-          if (pixSat > 0.10 && !isSideRain) {
-            float glowAmt = smoothstep(0.10, 0.42, pixSat) * (1.0 - blinkMask) * (1.0 - eclipseBlack);
+          if (pixSat > 0.08 && corneaMask > 0.02 && !isSideRain) {
+            float glowAmt = smoothstep(0.08, 0.40, pixSat) * corneaMask * (1.0 - blinkMask) * (1.0 - eclipseBlack);
             float ignBoost = 1.0 + u_fx.w * 1.95;
             col += t * (1.28 * glowAmt * ignBoost);
           }
 
           // Pure Animated White Noise Event + 3D Particle Burst flying straight toward the viewer (+Z)
-          if ((u_crt_static > 0.001 || u_crt_burst > 0.001) && !isSideRain) {
-            vec2 cmL = vec2((a_uv.x - pL.x) * 2.3, a_uv.y - pL.y);
-            vec2 cmR = vec2((a_uv.x - pR.x) * 2.3, a_uv.y - pR.y);
+          // Strictly locked inside the pixel-exact corneaMask (zero spillover outside the cornea/iris!)
+          if ((u_crt_static > 0.001 || u_crt_burst > 0.001) && !isSideRain && corneaMask > 0.02) {
+            vec2 cmL = vec2((a_uv.x - pL.x) * 2.3077, a_uv.y - pL.y);
+            vec2 cmR = vec2((a_uv.x - pR.x) * 2.3077, a_uv.y - pR.y);
             bool isLeftEye = length(cmL) <= length(cmR);
             vec2 cmNear = isLeftEye ? cmL : cmR;
-            vec3 eyeG = isLeftEye ? u_eye_geom_l : u_eye_geom_r;
-            float rIris = eyeG.x;
-            float upOff = eyeG.y;
-            float loOff = eyeG.z;
-            float rCornea = length(cmNear);
-            float upperArchY = upOff - 1.45 * cmNear.x * cmNear.x;
-            float lowerArchY = -loOff + 0.95 * cmNear.x * cmNear.x;
-            float noiseLidClip = smoothstep(upperArchY + 0.022, upperArchY - 0.028, cmNear.y)
-                               * smoothstep(lowerArchY - 0.055, lowerArchY + 0.020, cmNear.y);
-            float noiseZone = smoothstep(rIris * 2.22, rIris * 0.32, rCornea) * noiseLidClip * (1.0 - blinkMask);
+            float noiseZone = smoothstep(0.04, 0.78, corneaMask) * (1.0 - blinkMask);
             if (noiseZone > 0.004) {
               uint fr = uint(u_frame);
               // 2x square white-noise grain cells (pattern-free PCG3D integer hash)
-              uvec2 noiseCell = uvec2(floor(vec2(a_uv.x * 2.3, a_uv.y) * 165.0));
+              uvec2 noiseCell = uvec2(floor(vec2(a_uv.x * 2.3077, a_uv.y) * 165.0));
               float n = float(pcg3dV(uvec3(noiseCell.x, noiseCell.y, fr)).x) * (1.0 / 4294967295.0);
               float snow = smoothstep(0.10, 0.90, n);
               if (u_crt_static > 0.001) {
-                float crtMask = pow(noiseZone, 1.55) * u_crt_static;
+                float crtMask = noiseZone * u_crt_static;
                 vec3 noiseCol = vec3(snow * 1.42);
                 noiseCol += vec3(1.0, 0.99, 0.97) * (catchlightHdr * 0.95);
                 col = mix(col, noiseCol, crtMask);
@@ -4497,7 +4524,7 @@
           pendingDelta = new Float32Array(e.data.delta);
           latestTension = e.data.tension;
           if (!hasExactEyeGeom && e.data.eyes) liveEyes = e.data.eyes;
-          if (e.data.pupils) livePupils = e.data.pupils;
+          if (!hasExactEyeGeom && e.data.pupils) livePupils = e.data.pupils;
           if (e.data.mouth) liveMouth = e.data.mouth;
           if (e.data.feature) liveFeature = e.data.feature;
           if (typeof e.data.radius === "number") latestRadius = e.data.radius;
@@ -4575,6 +4602,21 @@
             const s = item.slot & 3;
             uploadHiTex(texDonor[s], item.bytes);
             if (item.depthBytes) uploadDepthTex(texDepthDonor[s], item.depthBytes);
+            // Keep per-eye exact pupil, geometry & tear duct locked when left (slot 0) or right (slot 1) donor updates
+            if (item.eyeGeom && (s === 0 || s === 1)) {
+              const eg = item.eyeGeom;
+              if (s === 0) {
+                if (eg.pupils) { livePupils[0] = eg.pupils[0]; livePupils[1] = eg.pupils[1]; }
+                if (eg.tears) { liveEyes[0] = eg.tears[0]; liveEyes[1] = eg.tears[1]; }
+                if (eg.tearConf) liveTearConf[0] = eg.tearConf[0];
+                if (eg.geomL) { liveEyeGeom[0] = eg.geomL[0]; liveEyeGeom[1] = eg.geomL[1]; liveEyeGeom[2] = eg.geomL[2]; }
+              } else {
+                if (eg.pupils) { livePupils[2] = eg.pupils[2]; livePupils[3] = eg.pupils[3]; }
+                if (eg.tears) { liveEyes[2] = eg.tears[2]; liveEyes[3] = eg.tears[3]; }
+                if (eg.tearConf) liveTearConf[1] = eg.tearConf[1];
+                if (eg.geomR) { liveEyeGeom[3] = eg.geomR[0]; liveEyeGeom[4] = eg.geomR[1]; liveEyeGeom[5] = eg.geomR[2]; }
+              }
+            }
             shedStartMs = now;
           }
         }
@@ -4867,6 +4909,10 @@
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, depthStateTex[depthStateIdx]);
         gl.uniform1i(gl.getUniformLocation(progParticles, "u_depth_state"), 1);
+
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, chimeraTex[chimeraIdx]);
+        gl.uniform1i(gl.getUniformLocation(progParticles, "u_chimera"), 2);
 
         const camAlpha = 1.0 - Math.exp(-dtSec * 10.0);
         camYaw += (targetYaw - camYaw) * camAlpha;
